@@ -1,0 +1,8 @@
+/target
+/vendor
+/models
+/samples
+/.dsh-briefs
+.dsh-brief.md
+*.wav
+*.onnx
