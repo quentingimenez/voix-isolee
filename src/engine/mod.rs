@@ -1,15 +1,23 @@
 //! Voice isolation engine: keeps only the enrolled voice.
 //!
-//! The chain is VoxLock (target-speaker extraction, removes other voices)
+//! The main chain is VoxLock (target-speaker extraction, removes other voices)
 //! followed by DPDFNet (noise suppression, removes what is not speech).
+//!
+//! VoxLock also erases the user's whispers and laughs, which do not match the
+//! voiceprint. A second, lightly denoised copy of the microphone (GTCRN) runs
+//! in parallel and the [`gate::RescueGate`] mixes it back when a removed sound
+//! is close to the microphone.
 
 mod ffi;
+pub mod gate;
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use anyhow::{bail, Context, Result};
+
+use gate::{GateConfig, RescueGate};
 
 /// Sample rate expected and produced by the engine.
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -18,6 +26,12 @@ pub const SAMPLE_RATE: u32 = 16_000;
 pub const MIN_VOICEPRINT_SECONDS: f32 = 3.0;
 
 const ENROLL_MODEL_FILE: &str = "voxlock_enroll.onnx";
+const DENOISE_MODEL_FILE: &str = "dpdfnet2.onnx";
+const RESCUE_MODEL_FILE: &str = "gtcrn_simple.onnx";
+
+/// Delay of DPDFNet's output relative to its input. The rescue stream is
+/// delayed by the same amount so both streams reach the gate aligned.
+const DENOISE_DELAY_SAMPLES: usize = 640;
 
 /// Trade-off between CPU load, delay and quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +40,7 @@ pub enum Mode {
     Leger,
     /// Default setting.
     Equilibre,
-    /// Full-precision isolation and the strongest noise suppression.
+    /// Full-precision isolation model.
     Qualite,
 }
 
@@ -70,20 +84,17 @@ impl Mode {
             Mode::Qualite => "voxlock_chunk.onnx",
         }
     }
-
-    fn denoise_model_file(self) -> &'static str {
-        match self {
-            Mode::Leger | Mode::Equilibre => "dpdfnet2.onnx",
-            Mode::Qualite => "dpdfnet8.onnx",
-        }
-    }
 }
 
 /// Streaming isolator. Must be driven by one thread at a time.
 pub struct Isolator {
     isolation: Stage,
     denoise: Stage,
+    rescue: Stage,
+    gate: RescueGate,
     isolated: Vec<f32>,
+    chain_queue: Vec<f32>,
+    rescue_queue: Vec<f32>,
     mode: Mode,
 }
 
@@ -94,14 +105,19 @@ impl Isolator {
         let enroll = existing(model_dir.join(ENROLL_MODEL_FILE))?;
         let chunk = existing(model_dir.join(mode.isolation_model_file()))?;
         let sample = existing(voiceprint_wav.to_path_buf())?;
-        let denoise = existing(model_dir.join(mode.denoise_model_file()))?;
+        let denoise = existing(model_dir.join(DENOISE_MODEL_FILE))?;
+        let rescue = existing(model_dir.join(RESCUE_MODEL_FILE))?;
 
         Ok(Self {
             isolation: Stage::voxlock(&enroll, &chunk, &sample)
                 .with_context(|| format!("chargement de l'isolation ({})", mode.label()))?,
             denoise: Stage::dpdfnet(&denoise)
                 .with_context(|| format!("chargement de l'antibruit ({})", mode.label()))?,
+            rescue: Stage::gtcrn(&rescue).context("chargement de l'antibruit de secours")?,
+            gate: RescueGate::new(GateConfig::default()),
             isolated: Vec::new(),
+            chain_queue: Vec::new(),
+            rescue_queue: vec![0.0; DENOISE_DELAY_SAMPLES],
             mode,
         })
     }
@@ -116,21 +132,61 @@ impl Isolator {
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         self.isolated.clear();
         self.isolation.process(input, &mut self.isolated);
-        self.denoise.process(&self.isolated, output);
+        self.denoise.process(&self.isolated, &mut self.chain_queue);
+        self.rescue.process(input, &mut self.rescue_queue);
+        self.run_gate(output);
     }
 
     /// Returns the audio still held by the models (end of stream).
     pub fn flush(&mut self, output: &mut Vec<f32>) {
         self.isolated.clear();
         self.isolation.flush(&mut self.isolated);
-        self.denoise.process(&self.isolated, output);
-        self.denoise.flush(output);
+        self.denoise.process(&self.isolated, &mut self.chain_queue);
+        self.denoise.flush(&mut self.chain_queue);
+        self.rescue.flush(&mut self.rescue_queue);
+        self.run_gate(output);
     }
 
     /// Forgets the audio context (after a microphone dropout, for instance).
     pub fn reset(&mut self) {
         self.isolation.reset();
         self.denoise.reset();
+        self.rescue.reset();
+        self.gate.reset();
+        self.chain_queue.clear();
+        self.rescue_queue.clear();
+        self.rescue_queue.resize(DENOISE_DELAY_SAMPLES, 0.0);
+    }
+
+    /// Sets how readily removed sounds are let back in. [`strict_gate`] never
+    /// lets anything back.
+    pub fn set_gate(&mut self, config: GateConfig) {
+        self.gate.set_config(config);
+    }
+
+    /// Share of the rescue stream currently mixed in, in `[0, 1]`.
+    pub fn gate_openness(&self) -> f32 {
+        self.gate.openness()
+    }
+
+    /// Feeds the gate with the samples both streams have in common.
+    fn run_gate(&mut self, output: &mut Vec<f32>) {
+        let ready = self.chain_queue.len().min(self.rescue_queue.len());
+        self.gate.process(
+            &self.chain_queue[..ready],
+            &self.rescue_queue[..ready],
+            output,
+        );
+        self.chain_queue.drain(..ready);
+        self.rescue_queue.drain(..ready);
+    }
+}
+
+/// Gate settings that never let a removed sound back in: pure isolation.
+pub fn strict_gate() -> GateConfig {
+    GateConfig {
+        min_removed_db: f32::INFINITY,
+        ..GateConfig::default()
     }
 }
 
@@ -154,6 +210,11 @@ impl Stage {
                 voice_sample: voice_sample.as_ptr(),
             };
         })
+    }
+
+    fn gtcrn(model_file: &Path) -> Result<Self> {
+        let model_file = c_path(model_file)?;
+        Self::create(|model| model.gtcrn.model = model_file.as_ptr())
     }
 
     fn dpdfnet(model_file: &Path) -> Result<Self> {

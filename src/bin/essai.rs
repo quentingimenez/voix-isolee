@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 
 use voix_isolee::audio::capture::{input_device_names, record_16k, Capture};
 use voix_isolee::audio::playback::output_device_names;
-use voix_isolee::audio::wav::write_mono_16k;
+use voix_isolee::audio::wav::{read_mono_16k, write_mono_16k};
 use voix_isolee::engine::{Isolator, Mode, SAMPLE_RATE};
 use voix_isolee::live::{LiveConfig, LiveSession};
 use voix_isolee::paths;
@@ -47,6 +47,7 @@ fn main() -> Result<()> {
             channel,
             seconds_arg(rest, DEFAULT_SECONDS)?,
         ),
+        "fichier" => process_file(rest),
         "direct" if rest.is_empty() => run_direct(device, channel, output, mode),
         "micros" if rest.is_empty() => list_microphones(),
         "sorties" if rest.is_empty() => list_outputs(),
@@ -74,13 +75,7 @@ fn record_voiceprint(device: Option<&str>, channel: Option<usize>, seconds: f32)
 }
 
 fn compare_modes(device: Option<&str>, channel: Option<usize>, seconds: f32) -> Result<()> {
-    let voiceprint = voiceprint_path();
-    if !voiceprint.is_file() {
-        bail!(
-            "empreinte introuvable : {} ; lancez d'abord « essai empreinte »",
-            voiceprint.display()
-        );
-    }
+    let voiceprint = require_voiceprint()?;
     let models = paths::models_dir()?;
 
     let samples = record(device, channel, seconds)?;
@@ -91,9 +86,41 @@ fn compare_modes(device: Option<&str>, channel: Option<usize>, seconds: f32) -> 
         folder.join("original.wav").display()
     );
 
+    process_modes(&samples, &models, &voiceprint, "")
+}
+
+/// Processes an existing WAV like `test`, writing `fichier-<mode>.wav`.
+fn process_file(args: &[String]) -> Result<()> {
+    let Some(raw) = args.first() else {
+        bail!("la commande fichier attend un chemin WAV");
+    };
+    if args.len() > 1 {
+        bail!("argument inattendu : {}", args[1]);
+    }
+    let samples = read_mono_16k(Path::new(raw))?;
+    let voiceprint = require_voiceprint()?;
+    let models = paths::models_dir()?;
+    process_modes(&samples, &models, &voiceprint, "fichier-")
+}
+
+fn require_voiceprint() -> Result<PathBuf> {
+    let voiceprint = voiceprint_path();
+    if !voiceprint.is_file() {
+        bail!(
+            "empreinte introuvable : {} ; lancez d'abord « essai empreinte »",
+            voiceprint.display()
+        );
+    }
+    Ok(voiceprint)
+}
+
+/// Runs the three modes on `samples`, writing `<prefix><mode>.wav`.
+fn process_modes(samples: &[f32], models: &Path, voiceprint: &Path, prefix: &str) -> Result<()> {
+    let folder = Path::new(OUTPUT_DIR);
     let duration = samples.len() as f32 / SAMPLE_RATE as f32;
+
     for mode in Mode::ALL {
-        let mut isolator = Isolator::new(&models, &voiceprint, mode)?;
+        let mut isolator = Isolator::new(models, voiceprint, mode)?;
         let mut output = Vec::with_capacity(samples.len());
         let start = Instant::now();
         for chunk in samples.chunks(mode.chunk_samples()) {
@@ -102,7 +129,7 @@ fn compare_modes(device: Option<&str>, channel: Option<usize>, seconds: f32) -> 
         isolator.flush(&mut output);
         let load = start.elapsed().as_secs_f32() / duration;
 
-        write_mono_16k(&folder.join(format!("{}.wav", mode.id())), &output)?;
+        write_mono_16k(&folder.join(format!("{prefix}{}.wav", mode.id())), &output)?;
         println!("{} : charge {:.0} % d'un cœur", mode.label(), load * 100.0);
     }
     Ok(())
@@ -358,6 +385,7 @@ fn print_help() {
     println!("Commandes :");
     println!("  empreinte [secondes]  enregistre l'empreinte vocale (défaut 20, minimum 5)");
     println!("  test [secondes]       compare les trois modes sur un enregistrement (défaut 20)");
+    println!("  fichier <wav>         traite un enregistrement existant dans les trois modes");
     println!("  direct                traite le micro en direct vers une sortie audio");
     println!("  micros                liste les micros d'entrée");
     println!("  sorties               liste les sorties audio");
