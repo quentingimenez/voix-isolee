@@ -12,11 +12,16 @@ use anyhow::{bail, Context, Result};
 use crate::audio::capture::Capture;
 use crate::audio::playback::Playback;
 use crate::audio::resample::Resampler;
+use crate::engine::gate::GateConfig;
 use crate::engine::{Isolator, Mode, SAMPLE_RATE};
 
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
 const LOAD_WINDOW_SECONDS: f32 = 1.0;
-const EXTRA_DELAY_MS: f32 = 25.0;
+/// Internal delay of the engine models: isolation (24 ms), denoise (40 ms)
+/// and gate (10 ms); not counted in bypass mode.
+const MODEL_DELAY_MS: f32 = 74.0;
+/// Windows input/output buffers and sample-rate conversions.
+const IO_DELAY_MS: f32 = 30.0;
 
 pub struct LiveConfig {
     pub input_device: Option<String>,
@@ -33,7 +38,9 @@ pub struct LiveStats {
     pub output_peak: f32,
     pub load: f32,
     pub delay_ms: f32,
+    pub gate: f32,
     pub underruns: u64,
+    pub drops: u64,
 }
 
 #[derive(Default)]
@@ -42,7 +49,11 @@ struct Stats {
     output_peak: AtomicU32,
     load: AtomicU32,
     delay_ms: AtomicU32,
+    gate: AtomicU32,
     underruns: AtomicU64,
+    drops: AtomicU64,
+    /// Requested `GateConfig::open_margin_db`, written by the session owner.
+    whisper_margin_db: AtomicU32,
 }
 
 struct Init {
@@ -131,8 +142,22 @@ impl LiveSession {
             output_peak: take_peak(&self.stats.output_peak),
             load: f32::from_bits(self.stats.load.load(Ordering::Relaxed)),
             delay_ms: f32::from_bits(self.stats.delay_ms.load(Ordering::Relaxed)),
+            gate: f32::from_bits(self.stats.gate.load(Ordering::Relaxed)),
             underruns: self.stats.underruns.load(Ordering::Relaxed),
+            drops: self.stats.drops.load(Ordering::Relaxed),
         }
+    }
+
+    /// How far below the user's normal level a whisper may be and still be
+    /// let through; larger values keep quieter whispers.
+    pub fn set_whisper_margin_db(&self, margin_db: f32) {
+        self.stats
+            .whisper_margin_db
+            .store(margin_db.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn whisper_margin_db(&self) -> f32 {
+        f32::from_bits(self.stats.whisper_margin_db.load(Ordering::Relaxed))
     }
 
     pub fn set_bypass(&self, bypass: bool) {
@@ -171,7 +196,10 @@ fn run(
 ) {
     let setup = (|| {
         let mut capture = Capture::open(config.input_device.as_deref(), config.input_channel)?;
-        let playback = Playback::open(config.output_device.as_deref())?;
+        let playback = Playback::open(
+            config.output_device.as_deref(),
+            config.mode.chunk_ms(),
+        )?;
         let isolator = Isolator::new(&config.model_dir, &config.voiceprint, config.mode)?;
         // Drop what the microphone captured while the models were loading.
         capture.read(&mut Vec::new())?;
@@ -232,6 +260,11 @@ fn process(
     let chunk_seconds = chunk as f32 / SAMPLE_RATE as f32;
     let mut load_ratio = 0.0_f32;
 
+    let mut gate_config = GateConfig::default();
+    stats
+        .whisper_margin_db
+        .store(gate_config.open_margin_db.to_bits(), Ordering::Relaxed);
+
     while !stop.load(Ordering::Relaxed) {
         native.clear();
         capture.read(&mut native)?;
@@ -244,7 +277,13 @@ fn process(
             block.clear();
             block.extend(engine_input.drain(..chunk));
             engine_output.clear();
-            let elapsed = if bypass.load(Ordering::Relaxed) {
+            let margin = f32::from_bits(stats.whisper_margin_db.load(Ordering::Relaxed));
+            if margin != gate_config.open_margin_db {
+                gate_config.open_margin_db = margin;
+                isolator.set_gate(gate_config);
+            }
+            let bypassed = bypass.load(Ordering::Relaxed);
+            let elapsed = if bypassed {
                 engine_output.extend_from_slice(&block);
                 0.0
             } else {
@@ -252,6 +291,12 @@ fn process(
                 isolator.process(&block, &mut engine_output);
                 start.elapsed().as_secs_f32()
             };
+            let gate = if bypassed {
+                0.0
+            } else {
+                isolator.gate_openness()
+            };
+            stats.gate.store(gate.to_bits(), Ordering::Relaxed);
             let instant = elapsed / chunk_seconds;
             let weight = (chunk_seconds / LOAD_WINDOW_SECONDS).min(1.0);
             load_ratio += (instant - load_ratio) * weight;
@@ -263,13 +308,17 @@ fn process(
                 raise_peak(&stats.output_peak, &device_output);
                 playback.write(&device_output)?;
             }
+            let model_delay = if bypassed { 0.0 } else { MODEL_DELAY_MS };
             let delay = config.mode.chunk_ms() as f32
+                + elapsed * 1000.0
+                + model_delay
                 + playback.buffered_samples() as f32 * 1000.0 / output_rate as f32
-                + EXTRA_DELAY_MS;
+                + IO_DELAY_MS;
             stats.delay_ms.store(delay.to_bits(), Ordering::Relaxed);
             stats
                 .underruns
                 .store(playback.underruns(), Ordering::Relaxed);
+            stats.drops.store(playback.drops(), Ordering::Relaxed);
         }
 
         if native.is_empty() {

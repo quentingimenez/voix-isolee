@@ -4,9 +4,8 @@
 //! followed by DPDFNet (noise suppression, removes what is not speech).
 //!
 //! VoxLock also erases the user's whispers and laughs, which do not match the
-//! voiceprint. A second, lightly denoised copy of the microphone (GTCRN) runs
-//! in parallel and the [`gate::RescueGate`] mixes it back when a removed sound
-//! is close to the microphone.
+//! voiceprint. The [`gate::RescueGate`] mixes the raw microphone back in when
+//! a removed sound is loud enough to come from the user.
 
 mod ffi;
 pub mod gate;
@@ -27,9 +26,8 @@ pub const MIN_VOICEPRINT_SECONDS: f32 = 3.0;
 
 const ENROLL_MODEL_FILE: &str = "voxlock_enroll.onnx";
 const DENOISE_MODEL_FILE: &str = "dpdfnet2.onnx";
-const RESCUE_MODEL_FILE: &str = "gtcrn_simple.onnx";
 
-/// Delay of DPDFNet's output relative to its input. The rescue stream is
+/// Delay of DPDFNet's output relative to its input. The raw microphone is
 /// delayed by the same amount so both streams reach the gate aligned.
 const DENOISE_DELAY_SAMPLES: usize = 640;
 
@@ -90,7 +88,6 @@ impl Mode {
 pub struct Isolator {
     isolation: Stage,
     denoise: Stage,
-    rescue: Stage,
     gate: RescueGate,
     isolated: Vec<f32>,
     chain_queue: Vec<f32>,
@@ -106,15 +103,20 @@ impl Isolator {
         let chunk = existing(model_dir.join(mode.isolation_model_file()))?;
         let sample = existing(voiceprint_wav.to_path_buf())?;
         let denoise = existing(model_dir.join(DENOISE_MODEL_FILE))?;
-        let rescue = existing(model_dir.join(RESCUE_MODEL_FILE))?;
+
+        // Calibrate the gate on the voiceprint: it is the user's normal voice.
+        let mut gate = RescueGate::new(GateConfig::default());
+        let voiceprint = crate::audio::wav::read_mono_16k(voiceprint_wav)?;
+        if let Some(level) = gate::speech_level_db(&voiceprint) {
+            gate.set_user_level_db(level);
+        }
 
         Ok(Self {
             isolation: Stage::voxlock(&enroll, &chunk, &sample)
                 .with_context(|| format!("chargement de l'isolation ({})", mode.label()))?,
             denoise: Stage::dpdfnet(&denoise)
                 .with_context(|| format!("chargement de l'antibruit ({})", mode.label()))?,
-            rescue: Stage::gtcrn(&rescue).context("chargement de l'antibruit de secours")?,
-            gate: RescueGate::new(GateConfig::default()),
+            gate,
             isolated: Vec::new(),
             chain_queue: Vec::new(),
             rescue_queue: vec![0.0; DENOISE_DELAY_SAMPLES],
@@ -133,7 +135,7 @@ impl Isolator {
         self.isolated.clear();
         self.isolation.process(input, &mut self.isolated);
         self.denoise.process(&self.isolated, &mut self.chain_queue);
-        self.rescue.process(input, &mut self.rescue_queue);
+        self.rescue_queue.extend_from_slice(input);
         self.run_gate(output);
     }
 
@@ -143,7 +145,6 @@ impl Isolator {
         self.isolation.flush(&mut self.isolated);
         self.denoise.process(&self.isolated, &mut self.chain_queue);
         self.denoise.flush(&mut self.chain_queue);
-        self.rescue.flush(&mut self.rescue_queue);
         self.run_gate(output);
     }
 
@@ -151,7 +152,6 @@ impl Isolator {
     pub fn reset(&mut self) {
         self.isolation.reset();
         self.denoise.reset();
-        self.rescue.reset();
         self.gate.reset();
         self.chain_queue.clear();
         self.rescue_queue.clear();
@@ -210,11 +210,6 @@ impl Stage {
                 voice_sample: voice_sample.as_ptr(),
             };
         })
-    }
-
-    fn gtcrn(model_file: &Path) -> Result<Self> {
-        let model_file = c_path(model_file)?;
-        Self::create(|model| model.gtcrn.model = model_file.as_ptr())
     }
 
     fn dpdfnet(model_file: &Path) -> Result<Self> {

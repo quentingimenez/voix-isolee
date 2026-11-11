@@ -1,27 +1,43 @@
-//! Audio playback via cpal, with a short bounded queue.
+//! Audio playback via cpal, with a latency-controlled queue.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
-const QUEUE_MS: usize = 500;
-const START_MS: usize = 40;
+/// Silence kept ahead of the audio to protect against gaps.
+const MARGIN_MS: usize = 20;
+/// Drift tolerated before the oldest samples are dropped.
+const SLACK_MS: usize = 40;
 
-/// Samples waiting for the audio thread, dropping the oldest on overflow.
+/// Output queue holding a steady latency target.
 struct SampleQueue {
     samples: VecDeque<f32>,
-    capacity: usize,
+    margin: usize,
+    target: usize,
+    ceiling: usize,
+    margin_pending: bool,
+    started: bool,
+    underruns: u64,
+    drops: u64,
 }
 
 impl SampleQueue {
-    fn new(capacity: usize) -> Self {
+    fn new(sample_rate: u32, block_ms: u32) -> Self {
+        let margin = ms_to_samples(sample_rate, MARGIN_MS);
+        let target = ms_to_samples(sample_rate, block_ms as usize + MARGIN_MS);
+        let ceiling = ms_to_samples(sample_rate, block_ms as usize + MARGIN_MS + SLACK_MS);
         Self {
-            samples: VecDeque::with_capacity(capacity),
-            capacity,
+            samples: VecDeque::with_capacity(ceiling),
+            margin,
+            target,
+            ceiling,
+            margin_pending: true,
+            started: false,
+            underruns: 0,
+            drops: 0,
         }
     }
 
@@ -29,27 +45,47 @@ impl SampleQueue {
         self.samples.len()
     }
 
+    /// Queues `mono` at the device sample rate. The first write, and the first
+    /// write after a gap, prepends the latency margin; a queue beyond the
+    /// drift ceiling loses its oldest samples down to the target.
     fn push(&mut self, mono: &[f32]) {
-        if mono.len() >= self.capacity {
-            self.samples.clear();
-            self.samples
-                .extend(mono[mono.len() - self.capacity..].iter().copied());
+        if mono.is_empty() {
             return;
         }
-        let excess = (self.samples.len() + mono.len()).saturating_sub(self.capacity);
-        if excess > 0 {
-            self.samples.drain(..excess);
+        self.started = true;
+        if self.margin_pending {
+            self.samples.extend(std::iter::repeat_n(0.0, self.margin));
+            self.margin_pending = false;
         }
         self.samples.extend(mono.iter().copied());
+        if self.samples.len() > self.ceiling {
+            let excess = self.samples.len() - self.target;
+            self.samples.drain(..excess);
+            self.drops += 1;
+        }
     }
+
+    /// Counts a gap when the queue cannot cover `frames` samples after
+    /// playback started, and arms the margin for the next write.
+    fn check_gap(&mut self, frames: usize) {
+        if self.started && self.samples.len() < frames {
+            self.underruns += 1;
+            self.margin_pending = true;
+        }
+    }
+
+    fn pop(&mut self) -> Option<f32> {
+        self.samples.pop_front()
+    }
+}
+
+fn ms_to_samples(sample_rate: u32, milliseconds: usize) -> usize {
+    (sample_rate as usize * milliseconds / 1000).max(1)
 }
 
 struct Shared {
     queue: Mutex<SampleQueue>,
     error: Mutex<Option<String>>,
-    started: AtomicBool,
-    underruns: AtomicU64,
-    start_threshold: usize,
 }
 
 /// Open output device, continuously fed by the cpal audio thread.
@@ -62,7 +98,8 @@ pub struct Playback {
 
 impl Playback {
     /// Opens `device_name`, or the Windows default output if `None`.
-    pub fn open(device_name: Option<&str>) -> Result<Self> {
+    /// `block_ms` is the duration of the blocks the caller will write.
+    pub fn open(device_name: Option<&str>, block_ms: u32) -> anyhow::Result<Playback> {
         let host = cpal::default_host();
         let device = match device_name {
             Some(name) => find_output(&host, name)?,
@@ -83,14 +120,9 @@ impl Playback {
             bail!("configuration invalide pour la sortie audio « {name} »");
         }
 
-        let capacity = (sample_rate as usize * QUEUE_MS / 1000).max(1);
-        let start_threshold = (sample_rate as usize * START_MS / 1000).clamp(1, capacity);
         let shared = Arc::new(Shared {
-            queue: Mutex::new(SampleQueue::new(capacity)),
+            queue: Mutex::new(SampleQueue::new(sample_rate, block_ms)),
             error: Mutex::new(None),
-            started: AtomicBool::new(false),
-            underruns: AtomicU64::new(0),
-            start_threshold,
         });
         let stream = match sample_format {
             SampleFormat::F32 => build_stream::<f32>(&device, &config, &shared),
@@ -144,7 +176,12 @@ impl Playback {
     }
 
     pub fn underruns(&self) -> u64 {
-        self.shared.underruns.load(Ordering::Relaxed)
+        self.shared.queue.lock().map_or(0, |queue| queue.underruns)
+    }
+
+    /// Number of drift catch-ups since playback started.
+    pub fn drops(&self) -> u64 {
+        self.shared.queue.lock().map_or(0, |queue| queue.drops)
     }
 }
 
@@ -205,20 +242,10 @@ where
         data.fill(T::from_sample(0.0_f32));
         return;
     };
-    if !shared.started.load(Ordering::Relaxed) {
-        if queue.len() < shared.start_threshold {
-            data.fill(T::from_sample(0.0_f32));
-            return;
-        }
-        shared.started.store(true, Ordering::Relaxed);
-    }
-
     let frames = data.len() / channels;
-    if queue.len() < frames {
-        shared.underruns.fetch_add(1, Ordering::Relaxed);
-    }
+    queue.check_gap(frames);
     for frame in data.chunks_mut(channels) {
-        let value = T::from_sample(queue.samples.pop_front().unwrap_or(0.0));
+        let value = T::from_sample(queue.pop().unwrap_or(0.0));
         for output in frame {
             *output = value;
         }
@@ -237,21 +264,67 @@ fn record_error(shared: &Shared, error: cpal::StreamError) {
 mod tests {
     use super::SampleQueue;
 
+    fn samples(queue: &SampleQueue) -> Vec<f32> {
+        queue.samples.iter().copied().collect()
+    }
+
     #[test]
     fn queue_is_bounded_and_drops_the_oldest_samples() {
-        let mut queue = SampleQueue::new(5);
-        queue.push(&[1.0, 2.0, 3.0]);
-        queue.push(&[4.0, 5.0, 6.0, 7.0]);
-        assert_eq!(queue.len(), 5);
-        assert_eq!(
-            queue.samples.iter().copied().collect::<Vec<_>>(),
-            vec![3.0, 4.0, 5.0, 6.0, 7.0]
-        );
+        let mut queue = SampleQueue::new(1000, 40);
+        queue.push(&[1.0; 40]);
+        queue.push(&[2.0; 200]);
+        assert_eq!(queue.len(), 60);
+        assert_eq!(queue.drops, 1);
+        let values = samples(&queue);
+        assert!(values.iter().all(|&sample| sample == 2.0));
+    }
 
-        queue.push(&[8.0, 9.0, 10.0, 11.0, 12.0, 13.0]);
-        assert_eq!(
-            queue.samples.iter().copied().collect::<Vec<_>>(),
-            vec![9.0, 10.0, 11.0, 12.0, 13.0]
-        );
+    #[test]
+    fn first_write_inserts_the_latency_margin() {
+        let mut queue = SampleQueue::new(1000, 40);
+        queue.push(&[0.5; 40]);
+        assert_eq!(queue.len(), 60);
+        let values = samples(&queue);
+        assert!(values[..20].iter().all(|&sample| sample == 0.0));
+        assert!(values[20..].iter().all(|&sample| sample == 0.5));
+    }
+
+    #[test]
+    fn drift_beyond_the_ceiling_drops_oldest_samples_to_target() {
+        let mut queue = SampleQueue::new(1000, 40);
+        queue.push(&[1.0; 40]);
+        queue.push(&[2.0; 50]);
+        assert_eq!(queue.len(), 60);
+        assert_eq!(queue.drops, 1);
+        let values = samples(&queue);
+        assert!(values[..10].iter().all(|&sample| sample == 1.0));
+        assert!(values[10..].iter().all(|&sample| sample == 2.0));
+    }
+
+    #[test]
+    fn gap_restores_the_margin_on_the_next_write() {
+        let mut queue = SampleQueue::new(1000, 40);
+        queue.push(&[1.0; 40]);
+        while queue.pop().is_some() {}
+        queue.check_gap(40);
+        queue.push(&[2.0; 40]);
+        assert_eq!(queue.len(), 60);
+        assert_eq!(queue.underruns, 1);
+        let values = samples(&queue);
+        assert!(values[..20].iter().all(|&sample| sample == 0.0));
+        assert!(values[20..].iter().all(|&sample| sample == 2.0));
+    }
+
+    #[test]
+    fn normal_writes_do_not_reinsert_the_margin() {
+        let mut queue = SampleQueue::new(1000, 40);
+        queue.push(&[1.0; 30]);
+        queue.push(&[2.0; 30]);
+        assert_eq!(queue.len(), 80);
+        assert_eq!(queue.drops, 0);
+        let values = samples(&queue);
+        assert!(values[..20].iter().all(|&sample| sample == 0.0));
+        assert!(values[20..50].iter().all(|&sample| sample == 1.0));
+        assert!(values[50..].iter().all(|&sample| sample == 2.0));
     }
 }

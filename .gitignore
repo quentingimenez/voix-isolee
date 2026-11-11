@@ -6,3 +6,4 @@
 .dsh-brief.md
 *.wav
 *.onnx
+/entrainement

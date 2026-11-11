@@ -30,8 +30,8 @@ impl Resampler {
         Self::with_params(from_hz, to_hz, CHUNK, params)
     }
 
-    /// Same conversion as [`Resampler::new`], tuned for live use: small
-    /// internal blocks and a short filter keep the added delay under 15 ms.
+    /// Same conversion as [`Resampler::new`], tuned for live use: blocks of
+    /// about 2.5 ms of input and a short filter keep the added delay low.
     pub fn low_latency(from_hz: u32, to_hz: u32) -> Result<Self> {
         let params = SincInterpolationParameters {
             sinc_len: 64,
@@ -40,7 +40,7 @@ impl Resampler {
             interpolation: SincInterpolationType::Linear,
             window: rubato::WindowFunction::BlackmanHarris2,
         };
-        let chunk = (from_hz / 100).max(1) as usize;
+        let chunk = (from_hz / 400).max(16) as usize;
         Self::with_params(from_hz, to_hz, chunk, params)
     }
 

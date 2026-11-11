@@ -12,6 +12,7 @@ use anyhow::{bail, Context, Result};
 use voix_isolee::audio::capture::{input_device_names, record_16k, Capture};
 use voix_isolee::audio::playback::output_device_names;
 use voix_isolee::audio::wav::{read_mono_16k, write_mono_16k};
+use voix_isolee::cli;
 use voix_isolee::engine::{Isolator, Mode, SAMPLE_RATE};
 use voix_isolee::live::{LiveConfig, LiveSession};
 use voix_isolee::paths;
@@ -25,8 +26,8 @@ const OUTPUT_DIR: &str = "essais";
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
-    let device = take_device(&mut args)?;
-    let channel = take_channel(&mut args)?;
+    let device = cli::take_input_device(&mut args)?;
+    let channel = cli::take_channel(&mut args)?;
     let output = take_output(&mut args)?;
     let mode = take_mode(&mut args)?;
     let Some((command, rest)) = args.split_first() else {
@@ -176,17 +177,38 @@ fn run_direct(
     );
     println!();
 
-    let (entered_tx, entered_rx) = mpsc::channel();
+    println!(
+        "Sensibilité aux chuchotements : tapez un nombre de 0 à 40 puis Entrée pour la changer \
+         (plus grand = chuchotements plus faibles acceptés). Entrée seule pour arrêter."
+    );
+    println!();
+
+    // Each typed line is either a new whisper margin or, when empty, the stop request.
+    let (entered_tx, entered_rx) = mpsc::channel::<Option<f32>>();
     thread::spawn(move || {
         let mut line = String::new();
-        if io::stdin().read_line(&mut line).is_ok() {
-            let _ = entered_tx.send(());
+        loop {
+            line.clear();
+            match io::stdin().read_line(&mut line) {
+                Ok(read) if read > 0 && !line.trim().is_empty() => {
+                    if let Ok(margin) = line.trim().replace(',', ".").parse::<f32>() {
+                        if entered_tx.send(Some(margin.clamp(0.0, 40.0))).is_err() {
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = entered_tx.send(None);
+                    return;
+                }
+            }
         }
     });
 
     loop {
         match entered_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Some(margin)) => session.set_whisper_margin_db(margin),
+            Ok(None) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
         if let Some(message) = session.error() {
@@ -197,12 +219,15 @@ fn run_direct(
 
         let stats = session.stats();
         print!(
-            "\rmicro {} sortie {}  charge {:3.0} %  retard {:3.0} ms  trous {}",
-            bar(stats.input_peak),
-            bar(stats.output_peak),
+            "\rmicro {} sortie {}  charge {:3.0} %  retard {:3.0} ms  porte {:3.0} %  sensibilité {:2.0}  trous {}  rattrapages {}   ",
+            cli::level_bar(stats.input_peak, 12),
+            cli::level_bar(stats.output_peak, 12),
             stats.load * 100.0,
             stats.delay_ms,
-            stats.underruns
+            stats.gate * 100.0,
+            session.whisper_margin_db(),
+            stats.underruns,
+            stats.drops
         );
         let _ = io::stdout().flush();
     }
@@ -210,11 +235,6 @@ fn run_direct(
     println!();
     session.stop();
     Ok(())
-}
-
-fn bar(peak: f32) -> String {
-    let filled = (peak.clamp(0.0, 1.0) * 12.0).round() as usize;
-    format!("[{}{}]", "#".repeat(filled), "-".repeat(12 - filled))
 }
 
 fn list_outputs() -> Result<()> {
@@ -265,67 +285,23 @@ fn record(device: Option<&str>, channel: Option<usize>, seconds: f32) -> Result<
 
 fn progress(seconds: f32, elapsed: f32, peak: f32) {
     let remaining = (seconds - elapsed).max(0.0);
-    let filled = (peak.clamp(0.0, 1.0) * 24.0).round() as usize;
-    let bar = format!("{}{}", "#".repeat(filled), "-".repeat(24 - filled));
-    print!("\r{remaining:5.1} s restantes  [{bar}]");
+    print!(
+        "\r{remaining:5.1} s restantes  {}",
+        cli::level_bar(peak, 24)
+    );
     let _ = io::stdout().flush();
-}
-
-/// Removes `--micro <text>` from `args` and resolves it to the single input
-/// device whose name contains `text` (case-insensitive).
-fn take_device(args: &mut Vec<String>) -> Result<Option<String>> {
-    let Some(index) = args.iter().position(|arg| arg == "--micro") else {
-        return Ok(None);
-    };
-    if index + 1 >= args.len() {
-        bail!("--micro attend un nom de micro (voir « essai micros »)");
-    }
-    let wanted = args.remove(index + 1).to_lowercase();
-    args.remove(index);
-
-    let mut matches: Vec<String> = input_device_names()?
-        .into_iter()
-        .filter(|name| name.to_lowercase().contains(&wanted))
-        .collect();
-    match matches.len() {
-        1 => Ok(matches.pop()),
-        0 => bail!("aucun micro ne contient « {wanted} » (voir « essai micros »)"),
-        _ => bail!(
-            "plusieurs micros contiennent « {wanted} » : {}",
-            matches.join(" ; ")
-        ),
-    }
-}
-
-/// Removes `--canal <n>` (1-based) from `args` and returns it 0-based.
-fn take_channel(args: &mut Vec<String>) -> Result<Option<usize>> {
-    let Some(index) = args.iter().position(|arg| arg == "--canal") else {
-        return Ok(None);
-    };
-    if index + 1 >= args.len() {
-        bail!("--canal attend un numéro de canal (1, 2, ...)");
-    }
-    let raw = args.remove(index + 1);
-    args.remove(index);
-    let number: usize = raw
-        .parse()
-        .ok()
-        .filter(|n| *n >= 1)
-        .with_context(|| format!("numéro de canal invalide : « {raw} »"))?;
-    Ok(Some(number - 1))
 }
 
 /// Removes `--sortie <text>` from `args` and resolves it to the single output
 /// device whose name contains `text` (case-insensitive).
 fn take_output(args: &mut Vec<String>) -> Result<Option<String>> {
-    let Some(index) = args.iter().position(|arg| arg == "--sortie") else {
-        return Ok(None);
-    };
-    if index + 1 >= args.len() {
+    if matches!(args.last(), Some(arg) if arg == "--sortie") {
         bail!("--sortie attend un nom de sortie (voir « essai sorties »)");
     }
-    let wanted = args.remove(index + 1).to_lowercase();
-    args.remove(index);
+    let Some(wanted) = cli::take_option(args, "--sortie")? else {
+        return Ok(None);
+    };
+    let wanted = wanted.to_lowercase();
 
     let mut matches: Vec<String> = output_device_names()?
         .into_iter()
@@ -343,14 +319,12 @@ fn take_output(args: &mut Vec<String>) -> Result<Option<String>> {
 
 /// Removes `--mode <id>` from `args`, defaulting to balanced.
 fn take_mode(args: &mut Vec<String>) -> Result<Mode> {
-    let Some(index) = args.iter().position(|arg| arg == "--mode") else {
-        return Ok(Mode::Equilibre);
-    };
-    if index + 1 >= args.len() {
+    if matches!(args.last(), Some(arg) if arg == "--mode") {
         bail!("--mode attend leger, equilibre ou qualite");
     }
-    let raw = args.remove(index + 1);
-    args.remove(index);
+    let Some(raw) = cli::take_option(args, "--mode")? else {
+        return Ok(Mode::Equilibre);
+    };
     let wanted = raw.to_lowercase();
     Mode::ALL
         .into_iter()

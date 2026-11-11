@@ -1,10 +1,18 @@
 //! Adaptive rescue gate: decides, every 10 ms, how much of the denoised
 //! close-microphone stream to mix back into the isolated voice.
 //!
-//! The isolator is clean but erases whispers and laughs. The rescue stream
-//! keeps everything close to the microphone, noise included. The gate opens
-//! only when the isolator removed meaningful energy and the rescue stream
-//! looks like a real, nearby sound rather than broadband hiss.
+//! The isolator is clean but erases whispers and laughs. The rescue stream is
+//! the raw microphone: it keeps everything, other voices and noise included.
+//! The user speaks a few centimetres from the microphone, so their sounds are
+//! louder there than anything else in the room. The gate therefore opens when
+//! the isolator removed a sound that is loud enough to be the user and that
+//! looks like one of the two things it wrongly erases: a whisper (unvoiced,
+//! not broadband hiss, lasting longer than a knock) or a laugh (voiced and
+//! louder than normal speech).
+//!
+//! The gate has memory: it opens on a clearly close sound (the loud parts of a
+//! whisper, which a distant voice rarely reaches) and then stays open on much
+//! weaker sounds, so the quiet syllables of the same whisper are kept too.
 //!
 //! `out = isolated + g * (rescue - isolated)` with `g` in `[0, 1]`.
 
@@ -29,18 +37,37 @@ const HISS_START_BIN: usize = 160;
 /// Last DFT bin (8 kHz, the Nyquist frequency).
 const HISS_END_BIN: usize = FRAME / 2;
 
+/// Duration of one analysis step, in milliseconds.
+const FRAME_MS: f32 = 10.0;
+
+/// How long a laugh must last before the gate opens, in milliseconds.
+const LAUGH_SUSTAIN_MS: f32 = 30.0;
+
+/// Share of high-frequency energy above which even an open gate lets go.
+const HOLD_HISS_LIMIT: f32 = 0.9;
+
 /// Thresholds of the gate. All levels are dBFS.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GateConfig {
-    /// Margin below the user level for an unvoiced nearby sound.
-    pub unvoiced_margin_db: f32,
-    /// Margin below the user level for a loud sound.
-    pub loud_margin_db: f32,
+    /// Margin below the user level for a removed whisper to open the gate.
+    /// Larger values accept quieter whispers and let more of the room through.
+    pub open_margin_db: f32,
+    /// How long a whisper must last before the gate opens, in milliseconds.
+    /// Shorter sounds are knocks and clicks.
+    pub sustain_ms: f32,
+    /// Margin above the user level for a removed voiced sound (a laugh) to
+    /// open the gate.
+    pub laugh_boost_db: f32,
+    /// Margin below the user level for any sound to keep an open gate open.
+    pub hold_margin_db: f32,
+    /// How long weak sounds can keep the gate open after the last sound that
+    /// was strong enough to open it, in milliseconds.
+    pub hold_ms: f32,
     /// Maximum share of high-frequency energy for an unvoiced sound.
     pub hiss_limit: f32,
     /// Minimum energy the isolator must have removed to open the gate.
     pub min_removed_db: f32,
-    /// User level before any adaptation.
+    /// User level assumed until `set_user_level_db` is called.
     pub initial_level_db: f32,
     /// Time needed for the gate to close completely, in milliseconds.
     pub release_ms: f32,
@@ -49,12 +76,15 @@ pub struct GateConfig {
 impl Default for GateConfig {
     fn default() -> Self {
         Self {
-            unvoiced_margin_db: 14.0,
-            loud_margin_db: 4.0,
+            open_margin_db: 10.0,
+            sustain_ms: 50.0,
+            laugh_boost_db: 8.0,
+            hold_margin_db: 20.0,
+            hold_ms: 1000.0,
             hiss_limit: 0.55,
             min_removed_db: 6.0,
             initial_level_db: -32.0,
-            release_ms: 120.0,
+            release_ms: 600.0,
         }
     }
 }
@@ -75,6 +105,9 @@ pub struct RescueGate {
     ring_pos: usize,
     frames: usize,
     level_db: f32,
+    frames_since_trigger: u32,
+    whisper_frames: u32,
+    laugh_frames: u32,
     smooth: f32,
     gain: f32,
     last_openness: f32,
@@ -115,6 +148,9 @@ impl RescueGate {
             ring_pos: 0,
             frames: 0,
             level_db,
+            frames_since_trigger: u32::MAX,
+            whisper_frames: 0,
+            laugh_frames: 0,
             smooth: 0.0,
             gain: 0.0,
             last_openness: 0.0,
@@ -124,6 +160,13 @@ impl RescueGate {
     /// Changes the thresholds without touching the audio history.
     pub fn set_config(&mut self, config: GateConfig) {
         self.config = config;
+    }
+
+    /// Sets the user's normal speech level, measured on the voiceprint. The
+    /// level is a fixed reference: tracking it live made the thresholds drift
+    /// with how loudly the user had just spoken.
+    pub fn set_user_level_db(&mut self, level_db: f32) {
+        self.level_db = level_db;
     }
 
     pub fn user_level_db(&self) -> f32 {
@@ -156,7 +199,7 @@ impl RescueGate {
         }
     }
 
-    /// Forgets the audio history and the learned level, keeps the configuration.
+    /// Forgets the audio history; keeps the configuration and the user level.
     pub fn reset(&mut self) {
         self.isolated_frame.fill(0.0);
         self.rescue_frame.fill(0.0);
@@ -167,7 +210,9 @@ impl RescueGate {
         self.hop_fill = 0;
         self.ring_pos = 0;
         self.frames = 0;
-        self.level_db = self.config.initial_level_db;
+        self.frames_since_trigger = u32::MAX;
+        self.whisper_frames = 0;
+        self.laugh_frames = 0;
         self.smooth = 0.0;
         self.gain = 0.0;
         self.last_openness = 0.0;
@@ -195,22 +240,37 @@ impl RescueGate {
         let e_isolated = frame_db(&self.isolated_frame);
         let e_rescue = frame_db(&self.rescue_frame);
         let removed = e_rescue - e_isolated;
-        let voicing = voicing(&self.rescue_frame);
         let energy = self.rescue_frame.iter().map(|s| s * s).sum::<f32>();
         let hiss = self.hiss_share(&self.rescue_frame, energy);
 
-        if removed < 3.0 && voicing > 0.45 && e_isolated > -50.0 {
-            self.level_db += 0.02 * (e_isolated - self.level_db);
-        }
-
-        let unvoiced = voicing < 0.35
-            && e_rescue > self.level_db - self.config.unvoiced_margin_db
+        let was_removed = removed > self.config.min_removed_db;
+        let voicing = voicing(&self.rescue_frame);
+        let whisper = was_removed
+            && voicing < 0.35
+            && e_rescue > self.level_db - self.config.open_margin_db
             && hiss < self.config.hiss_limit;
-        let loud = e_rescue > self.level_db - self.config.loud_margin_db;
-        let candidate = removed > self.config.min_removed_db && (unvoiced || loud);
+        let laugh = was_removed
+            && voicing >= 0.45
+            && e_rescue > self.level_db + self.config.laugh_boost_db;
+        self.whisper_frames = if whisper { self.whisper_frames + 1 } else { 0 };
+        self.laugh_frames = if laugh { self.laugh_frames + 1 } else { 0 };
+        let trigger = self.whisper_frames as f32 * FRAME_MS >= self.config.sustain_ms
+            || self.laugh_frames as f32 * FRAME_MS >= LAUGH_SUSTAIN_MS;
+        self.frames_since_trigger = if trigger {
+            0
+        } else {
+            self.frames_since_trigger.saturating_add(1)
+        };
+        // Weak sounds only extend an opening that a strong one started recently.
+        let held = self.smooth > 0.0
+            && (self.frames_since_trigger as f32) * FRAME_MS < self.config.hold_ms
+            && was_removed
+            && e_rescue > self.level_db - self.config.hold_margin_db
+            && hiss < HOLD_HISS_LIMIT;
+        let candidate = trigger || held;
 
         let target = if candidate { 1.0 } else { 0.0 };
-        let release = 10.0 / self.config.release_ms;
+        let release = FRAME_MS / self.config.release_ms;
         self.smooth = (self.smooth - release).max(target);
         let gain = self.smooth;
 
@@ -254,6 +314,26 @@ impl RescueGate {
         }
         band / (FRAME as f32 * energy + 1e-12)
     }
+}
+
+/// Level of the voiced speech in `samples` (mono, 16 kHz), on the scale the
+/// gate uses for its thresholds. `None` if there is too little speech.
+pub fn speech_level_db(samples: &[f32]) -> Option<f32> {
+    let gate = RescueGate::new(GateConfig::default());
+    let mut ring = [0.0; FRAME];
+    let mut frame = [0.0; FRAME];
+    let mut sum = 0.0;
+    let mut count = 0u32;
+    for window in samples.windows(FRAME).step_by(HOP) {
+        ring.copy_from_slice(window);
+        prepare_frame(&ring, 0, &gate.window, &mut frame);
+        let level = frame_db(&frame);
+        if level > -50.0 && voicing(&frame) > 0.45 {
+            sum += level;
+            count += 1;
+        }
+    }
+    (count >= 20).then(|| sum / count as f32)
 }
 
 /// Copies the last `FRAME` samples starting at `start`, removes the mean and
@@ -341,7 +421,7 @@ mod tests {
             previous[1] = previous[0];
             previous[0] = white;
         }
-        normalize(&mut samples, 0.01);
+        normalize(&mut samples, 0.03);
         samples
     }
 
@@ -360,7 +440,7 @@ mod tests {
             samples.push(sample - previous);
             previous = sample;
         }
-        normalize(&mut samples, 0.01);
+        normalize(&mut samples, 0.03);
         samples
     }
 
@@ -417,6 +497,59 @@ mod tests {
         );
     }
 
+    /// A whisper about three times weaker than `low_passed_noise`: too quiet to open
+    /// the gate, loud enough to hold it.
+    fn faint_whisper(seed: u32) -> Vec<f32> {
+        low_passed_noise(LEN, seed)
+            .iter()
+            .map(|sample| sample * 0.3)
+            .collect()
+    }
+
+    #[test]
+    fn faint_whisper_alone_stays_closed() {
+        let (isolated, rescue) = scenario(&faint_whisper(5));
+        let mut gate = RescueGate::new(GateConfig::default());
+        let mut output = Vec::new();
+        gate.process(&isolated, &rescue, &mut output);
+
+        assert!(gate.openness() < 0.1, "porte ouverte : {}", gate.openness());
+    }
+
+    #[test]
+    fn open_gate_holds_on_a_faint_whisper() {
+        // 0.4 s of faint whisper: shorter than the default hold duration.
+        let mut tail = low_passed_noise(LEN / 2, 7);
+        tail.extend(&faint_whisper(5)[..6400]);
+        let (isolated, rescue) = scenario(&tail);
+        let mut gate = RescueGate::new(GateConfig::default());
+        let mut output = Vec::new();
+        gate.process(&isolated, &rescue, &mut output);
+
+        assert!(gate.openness() > 0.9, "porte refermée : {}", gate.openness());
+    }
+
+    #[test]
+    fn hold_expires_without_a_new_strong_sound() {
+        let mut tail = low_passed_noise(LEN / 2, 7);
+        for seed in [5, 6, 8] {
+            tail.extend(faint_whisper(seed));
+        }
+        let (isolated, rescue) = scenario(&tail);
+        let mut gate = RescueGate::new(GateConfig::default());
+        let mut output = Vec::new();
+        gate.process(&isolated, &rescue, &mut output);
+
+        assert!(gate.openness() < 0.1, "porte ouverte : {}", gate.openness());
+    }
+
+    #[test]
+    fn speech_level_matches_the_signal_level() {
+        let level = speech_level_db(&voice(150.0, 0.03, LEN)).unwrap();
+        assert!((level - -34.7).abs() < 3.0, "niveau mesuré : {level:.1} dB");
+        assert!(speech_level_db(&[0.0; 16_000]).is_none());
+    }
+
     #[test]
     fn high_frequency_hiss_stays_closed() {
         let tail = high_passed_noise(LEN, 11);
@@ -443,7 +576,7 @@ mod tests {
 
     #[test]
     fn loud_laugh_opens() {
-        let tail = voice(300.0, 0.05, LEN);
+        let tail = voice(300.0, 0.15, LEN);
         let (isolated, rescue) = scenario(&tail);
         let mut gate = RescueGate::new(GateConfig::default());
         let mut output = Vec::new();

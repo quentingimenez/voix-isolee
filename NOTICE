@@ -1,0 +1,19 @@
+Voix isolée
+Copyright 2026 Quentin Gimenez
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The release archive bundles these third-party libraries, unchanged:
+
+- sherpa-onnx (https://github.com/k2-fsa/sherpa-onnx), Apache-2.0.
+- ONNX Runtime (https://github.com/microsoft/onnxruntime), MIT License,
+  Copyright Microsoft Corporation.
+
+The installer downloads these models from their upstream projects; they are
+not part of this repository or of the release archive, and remain under their
+own licenses:
+
+- VoxLock (https://github.com/arbazsiddiqui/voxlock), Apache-2.0,
+  Copyright 2026 Arbaz Siddiqui; fine-tuned from the REAL-TSE WeSep baseline.
+- DPDFNet (https://huggingface.co/Ceva-IP/DPDFNet), as distributed in the
+  sherpa-onnx "speech-enhancement-models" release.
