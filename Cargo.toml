@@ -1,0 +1,18 @@
+[package]
+name = "voix-isolee"
+version = "0.1.0"
+edition = "2021"
+description = "Isolation de voix en direct : ne laisse passer que votre voix"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+hound = "3.5"
+rubato = "0.16"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
