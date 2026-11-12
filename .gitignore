@@ -7,3 +7,4 @@
 *.wav
 *.onnx
 /entrainement
+__pycache__/
